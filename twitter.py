@@ -1,142 +1,122 @@
-from flask import Flask, request, redirect, url_for, session, flash, g, \
-     render_template
-from flaskext.oauth import OAuth
+## twitter.py
+##
+## Twitter class to retrieve the user informations, after login on 
+## FlightPooling app
+##
+## Author: Rafael Lucas
 
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
+import json
+import oauth2 as oauth
+import urlparse, urllib
 
-# configuration
-DATABASE_URI = 'sqlite:////tmp/flask-oauth.db'
-SECRET_KEY = 'development key'
-DEBUG = True
+#Errer Class
+class TwiterError(Exception):
+    """ Twitter class error
 
-app = Flask(__name__)
-app.debug = DEBUG
-app.secret_key = SECRET_KEY
-oauth = OAuth()
+        All the errors (exceptions) getting on the code will be
+        redirected to here
+    """
 
-# Use Twitter as example remote application
-twitter = oauth.remote_app('twitter',
+    def __init__(self, value):
+        self.parameter = value
+    def __str__(self):
+        return repr(self.parameter)
+
+class Twiter(object):
+    """ Twitter class
+
+        This is the main class that handle with twitter login and informations
+        about the user.           
+    """
+
+    callback_url =      None
     base_url='http://api.twitter.com/1/',
     request_token_url='http://api.twitter.com/oauth/request_token',
     access_token_url='http://api.twitter.com/oauth/access_token',
     authorize_url='http://api.twitter.com/oauth/authenticate',
-    consumer_key=TWITTER_CONSUMER_KEY,
-    consumer_secret=TWITTER_SECRET_KEY
-)
+    consumer = None
+    _request_token = None
+    _access_token = None    
 
-# setup sqlalchemy
-engine = create_engine(DATABASE_URI)
-db_session = scoped_session(sessionmaker(autocommit=False,
-                                         autoflush=False,
-                                         bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+    def __init__(self, consumer_key, consumer_secret, callback_url):
+        """ Constructor. """
 
+        self.consumer = oauth.Consumer(consumer_key, consumer_secret)
+        self.callback_url = callback_url
+        
+    def request_token(self):
+        """ request_token() method
+            
+            This method will retrieve the user request_token and set an existent
+            parameter.
+        """
 
-def init_db():
-    Base.metadata.create_all(bind=engine)
+        client = oauth.Client(self.consumer)
+        resp, content = client.request(self.request_token_url, "POST", 
+                                       body=urllib.urlencode({'oauth_callback':self.callback_url}))
+    
+        if resp['status'] != '200':
+            raise TwiterError("Invalid response %s." % resp['status'])
+        
+        request_token = dict(urlparse.parse_qsl(content))
+        self._request_token = request_token
+        
+    def get_authorize_url(self):
+        """ get_authorize_url() method
 
+            Will send to user an dialog authorization on twitter to get the 
+            informations after it. First the method verifies the user access_token
+            and after send a url, asking for authorization.
 
-class User(Base):
-    __tablename__ = 'users'
-    id = Column('user_id', Integer, primary_key=True)
-    name = Column(String(60))
-    oauth_token = Column(String(200))
-    oauth_secret = Column(String(200))
+            \return The url after processing by get_authorize_url() method.
+        """
 
-    def __init__(self, name):
-        self.name = name
+        if not self._request_token:
+            self.request_token()
+        return "%s??oauth_token=%s" % (self.authorize_url, self._request_token['oauth_token'])
+    
+    def verifier(self, code):
+        """ verifier() method
 
+            Will check the user access token and set an existent token.
+        """
 
-@app.before_request
-def before_request():
-    g.user = None
-    if 'user_id' in session:
-        g.user = User.query.get(session['user_id'])
+        
+        if not self._request_token:
+            self.request_token()
 
+        token = oauth.Token(self._request_token['oauth_token'], self._request_token['oauth_token_secret'])
+        token.set_verifier(code)
+        client = oauth.Client(self.consumer, token)
+        resp, content = client.request(self.access_token_url, "POST")
+        if resp['status'] != '200':
+            print resp
+            raise TwiterError("Invalid response %s." % resp['status'])
+        access_token = dict(urlparse.parse_qsl(content))
+        self._access_token = access_token
+        
+    def get_profile(self,fields=('id','first-name','last-name','headline','summary')):
+        """ get_profile() method
 
-@app.after_request
-def after_request(response):
-    db_session.remove()
-    return response
+            This method get the user information and returns it using
+            JSON format.
 
+            \return the user informations in JSON format.
+        """
 
-@twitter.tokengetter
-def get_twitter_token():
-    user = g.user
-    if user is not None:
-        return user.oauth_token, user.oauth_secret
-
-
-@app.route('/')
-def index():
-    tweets = None
-    if g.user is not None:
-        resp = twitter.get('statuses/home_timeline.json')
-        if resp.status == 200:
-            tweets = resp.data
-        else:
-            flash('Unable to load tweets from Twitter. Maybe out of '
-                  'API calls or Twitter is overloaded.')
-    return render_template('index.html', tweets=tweets)
-
-
-@app.route('/tweet', methods=['POST'])
-def tweet():
-    if g.user is None:
-        return redirect(url_for('login', next=request.url))
-    status = request.form['tweet']
-    if not status:
-        return redirect(url_for('index'))
-    resp = twitter.post('statuses/update.json', data={
-        'status':       status
-    })
-    if resp.status == 403:
-        flash('Your tweet was too long.')
-    elif resp.status == 401:
-        flash('Authorization error with Twitter.')
-    else:
-        flash('Successfully tweeted your tweet (ID: #%s)' % resp.data['id'])
-    return redirect(url_for('index'))
-
-
-@app.route('/login')
-def login():
-    return twitter.authorize(callback=url_for('oauth_authorized',
-        next=request.args.get('next') or request.referrer or None))
-
-
-@app.route('/logout')
-def logout():
-    session.pop('user_id', None)
-    flash('You were signed out')
-    return redirect(request.referrer or url_for('index'))
-
-
-@app.route('/oauth-authorized')
-@twitter.authorized_handler
-def oauth_authorized(resp):
-    next_url = request.args.get('next') or url_for('index')
-    if resp is None:
-        flash(u'You denied the request to sign in.')
-        return redirect(next_url)
-
-    user = User.query.filter_by(name=resp['screen_name']).first()
-
-    if user is None:
-        user = User(resp['screen_name'])
-        db_session.add(user)
-
-    user.oauth_token = resp['oauth_token']
-    user.oauth_secret = resp['oauth_token_secret']
-    db_session.commit()
-
-    session['user_id'] = user.id
-    flash('You were signed in')
-    return redirect(next_url)
-
-
-if __name__ == '__main__':
-    app.run()
+        if not self._access_token:
+            raise TwiterError("Authentication needed!")
+            
+        token = oauth.Token(self._access_token['oauth_token'], self._access_token['oauth_token_secret'])
+        client = oauth.Client(self.consumer, token)
+        profile_url = self.profile_url % ",".join(fields)
+        resp, content = client.request(profile_url,headers={"x-li-format":'json'})
+        
+        if resp['status'] != '200':
+            print resp
+            raise TwiterError("Invalid response %s." % resp['status'])
+        
+        try:
+            return json.loads(content)
+        except Exception, e:
+            raise TwiterError("Invalid json %s." % unicode(e))
